@@ -1,0 +1,135 @@
+# CNTK Configuration File for creating a slot tagger and an intent tagger.
+
+command = TrainTagger:OutputTagger:TestTagger
+
+makeMode = false ; traceLevel = 0 ; deviceId = "auto"
+
+rootDir = "." ; 
+dataDir  = "data" ; 
+modelDir = "$rootDir$/models"
+train_file = "train.ctf"
+test_file = "test.ctf"
+
+std_name = "log"
+stderr = "$modelDir$/$std_name$"
+model_name = "slu.cmf"
+modelPath = "$modelDir$/$model_name$"
+output_name = "model.writeaction" 
+
+vocab_size = 574
+num_labels = 127
+emb_hid_dim = 150
+
+vocabSize = $vocab_size$ ; numLabels = $num_labels$ ; numIntents = 26    # number of words in vocab, slot labels, and intent labels
+learningRates = 0.01*2:0.005*12:0.001 ;
+epochs = 30
+numLayers = 1
+grad_type = "fsAdagrad"
+
+# The command to train the LSTM model
+TrainTagger = {
+    action = "train"
+    BrainScriptNetworkBuilder = {
+        inputDim = $vocabSize$
+        labelDim = $numLabels$
+        embDim = $emb_hid_dim$
+        hiddenDim = $emb_hid_dim$
+        
+        BiRecurrentLSTMLayer {outDim} = {
+            F = RecurrentLSTMLayer {outDim, goBackwards=true, init='uniform'}
+            G = RecurrentLSTMLayer {outDim, goBackwards=false, init='uniform'}
+            apply (x) = Splice(F(x):G(x))
+        }.apply
+        
+        BLSTMBNLayer {hiddenDim} = {
+            F = BiRecurrentLSTMLayer {hiddenDim} 
+            G = BatchNormalizationLayer {normalizationTimeConstant=2048} 
+            apply (x) = G(F(x)) 
+        }.apply
+        
+        BLSTMBNLayerStack {hiddenDim, numLayers} = 
+            if numLayers == 1
+            then { 
+                apply = BLSTMBNLayer {hiddenDim}
+            }.apply
+            else { 
+                apply(x) = BLSTMBNLayer {hiddenDim}(BLSTMBNLayerStack {hiddenDim, numLayers-1}(x) ) 
+            }.apply
+        
+        model = Sequential (
+            LinearLayer {embDim, init='uniform', bias=false} :
+            BatchNormalizationLayer {normalizationTimeConstant=2048} :
+            BLSTMBNLayerStack {hiddenDim, $numLayers$} :
+            LinearLayer {labelDim, init='uniform'}
+        )
+
+        # features
+        query      = Input {inputDim}
+        slotLabels = Input {labelDim}
+
+        # model application
+        z = model (query)
+
+        # loss and metric
+        ce   = CrossEntropyWithSoftmax (slotLabels, z)
+        errs = ClassificationError     (slotLabels, z)
+
+        featureNodes    = (query)
+        labelNodes      = (slotLabels)
+        criterionNodes  = (ce)
+        evaluationNodes = (errs)
+        outputNodes     = (z)
+    }
+
+    SGD = {
+        maxEpochs = $epochs$ ; epochSize = 36000
+
+        minibatchSize = 70
+
+        learningRatesPerSample = $learningRates$ 
+        gradUpdateType = $grad_type$
+        fsAdagradTargetAvDenom = 0.0025
+        gradientClippingWithTruncation = true ; clippingThresholdPerSample = 15.0
+
+        firstMBsToShowResult = 10 ; numMBsToShowResult = 100
+    }
+
+    reader = {
+        readerType = "CNTKTextFormatReader"
+        file = "$dataDir$/$train_file$"
+        randomize = true
+        input = {
+            query        = { alias = "S0" ; dim = $vocabSize$ ;  format = "sparse" }
+            intentLabels = { alias = "S1" ; dim = $numIntents$ ; format = "sparse" }
+            slotLabels   = { alias = "S2" ; dim = $numLabels$ ;  format = "sparse" }
+        }
+    }
+    
+}
+
+OutputTagger = {
+    action = "write"
+    traceLevel = 1
+    epochSize = 0
+    defaultHiddenActivity = 0.1
+    BrainScriptNetworkBuilder = {
+        modelAsTrained = BS.Network.Load ("$modelPath$")
+        final = modelAsTrained.z
+    }
+    outputPath = $modelDir$/$output_name$
+    outputNodeNames = final
+	format = {
+		type = "category"
+		labelMappingFile = "$dataDir$/atis.label"
+	}
+    reader = {
+        readerType = "CNTKTextFormatReader"
+        file = "$dataDir$/$test_file$"
+        randomize = false
+        input = {
+            query        = { alias = "S0" ; dim = $vocabSize$ ;  format = "sparse" }
+            intentLabels = { alias = "S1" ; dim = $numIntents$ ; format = "sparse" }
+            slotLabels   = { alias = "S2" ; dim = $numLabels$ ;  format = "sparse" }
+        }
+    }
+}
